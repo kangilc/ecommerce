@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Gradle Imported" enabled="true">
+        <outputRelativeToContentRoot value="true" />
+        <processorPath useClasspath="false">
+          <entry name="$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.projectlombok/lombok/1.18.30/f195ee86e6c896ea47a1d39defbe20eb59cd149d/lombok-1.18.30.jar" />
+        </processorPath>
+        <module name="ecommerce_be.shop-product.main" />
+        <module name="ecommerce_be.shop-common.main" />
+        <module name="ecommerce_be.shop-order.main" />
+        <module name="ecommerce_be.shop-payment.main" />
+      </profile>
+    </annotationProcessing>
+    <bytecodeTargetLevel target="17" />
+  </component>
+  <component name="JavacSettings">
+    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
+      <module name="ecommerce_be.shop-common" options="-parameters" />
+      <module name="ecommerce_be.shop-common.main" options="-parameters" />
+      <module name="ecommerce_be.shop-common.test" options="-parameters" />
+      <module name="ecommerce_be.shop-order" options="-parameters" />
+      <module name="ecommerce_be.shop-order.main" options="-parameters" />
+      <module name="ecommerce_be.shop-order.test" options="-parameters" />
+      <module name="ecommerce_be.shop-payment" options="-parameters" />
+      <module name="ecommerce_be.shop-payment.main" options="-parameters" />
+      <module name="ecommerce_be.shop-payment.test" options="-parameters" />
+      <module name="ecommerce_be.shop-product" options="-parameters" />
+      <module name="ecommerce_be.shop-product.main" options="-parameters" />
+      <module name="ecommerce_be.shop-product.test" options="-parameters" />
+    </option>
+  </component>
+</project>

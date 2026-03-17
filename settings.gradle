@@ -1,0 +1,5 @@
+rootProject.name = 'ecommerce_be'
+include 'shop-common'
+include 'shop-order'
+include 'shop-product'
+include 'shop-payment'
