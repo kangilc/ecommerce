@@ -341,3 +341,15 @@ curl -X POST http://localhost:8081/api/orders \
 ```
 
 위 로직이 정상 작동되는지 테스트해 보시고, 오류가 발생하거나 보완이 필요한 부분(Saga 패턴 적용, 실패 보상 트랜잭션 처리 등)이 있다면 말씀해 주세요!
+
+# 직렬화/역직렬화 ClassCastException
+```
+이벤트(kafka)  기반 e-commerce를 진행하고 있다. 다음으로 프로젝트가 나뉘어져 있는데
+rootProject.name = 'ecommerce_be'
+include 'shop-common'
+include 'shop-order'
+include 'shop-product'
+include 'shop-payment'
+order, product, payment의 yml 설정에 consumer만 있는데. order 프로젝트 OrderEventProducer 클래스에서 kafkaTemplate.send(TOPIC, event); 보낸다.
+이 때 직렬화/역직렬화 불일치 발생 yml 설정을 어디에 어떻게 변경해야 하는가
+```
