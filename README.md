@@ -353,3 +353,193 @@ include 'shop-payment'
 order, product, payment의 yml 설정에 consumer만 있는데. order 프로젝트 OrderEventProducer 클래스에서 kafkaTemplate.send(TOPIC, event); 보낸다.
 이 때 직렬화/역직렬화 불일치 발생 yml 설정을 어디에 어떻게 변경해야 하는가
 ```
+
+좋은 질문입니다. **멀티모듈(ecommerce\_be)에서 Producer/Consumer 직렬화 설정이 어긋나 생기는 문제**는, 보통 다음 두 경우 중 하나 때문에 발생합니다.
+
+1.  `shop-order`(Producer) 쪽에 **producer 설정이 없거나 기본값(StringSerializer)** 으로 되어 있음
+2.  `shop-product`, `shop-payment` 등 Consumer 쪽은 **JsonDeserializer**인데, Producer가 **StringSerializer**로 보내는 등 **불일치**
+
+아래에 **최소 수정 패치**와 **구조별 권장 배치**를 함께 드릴게요.
+
+***
+
+## 결론부터: 어디에 어떻게 바꿔야 하나?
+
+**원칙**:
+
+*   **보내는 곳(Producer: `shop-order`)에 `spring.kafka.producer`를 명확히 설정**
+*   **받는 곳(Consumer: `shop-order` 자체의 내부 소비가 없다면 X), `shop-product`, `shop-payment`에 `spring.kafka.consumer`를 맞춰 설정**
+*   **포맷은 일치**(예: 모두 JSON)시키고, Listener 시그니처(`OrderCreatedEvent`)와 ContainerFactory 제네릭 타입도 일치
+
+### 옵션 A. 각 모듈별로 yml을 분리 유지 (가장 직관적)
+
+*   `shop-order` (Producer) — `application.yml`에 **producer** 설정 추가
+*   `shop-product`, `shop-payment` (Consumer) — `application.yml`에 **consumer** 설정 유지/정비
+
+#### `shop-order/src/main/resources/application.yml` (Producer)
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # 타입 정보 헤더를 추가해서 Consumer가 자동 타입 매핑 가능
+        spring.json.add.type.headers: true
+        # 순수 JSON만 보내고 싶다면 false로, 이 경우 Consumer에 default.type 지정 필요
+        # spring.json.add.type.headers: false
+```
+
+> `kafkaTemplate.send(TOPIC, event)`를 이 설정으로 보내면 **value가 JSON으로 직렬화**됩니다.
+
+#### `shop-product/src/main/resources/application.yml` (Consumer)
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: product-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.ecommerce.common.event
+        spring.json.use.type.headers: true
+        # 만약 Producer가 타입 헤더를 붙이지 않는다면 아래 기본 타입 지정
+        # spring.json.value.default.type: com.ecommerce.common.event.OrderCreatedEvent
+```
+
+#### `shop-payment/src/main/resources/application.yml` (Consumer)
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: payment-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.ecommerce.common.event
+        spring.json.use.type.headers: true
+        # 필요시 default.type 지정
+        # spring.json.value.default.type: com.ecommerce.common.event.OrderCreatedEvent
+```
+
+*   Listener는 다음처럼 **도메인 타입**으로 받는 것이 깔끔합니다.
+
+```java
+@KafkaListener(topics = "order.created", containerFactory = "orderEventContainerFactory")
+public void onMessage(OrderCreatedEvent event) { ... }
+```
+
+*   그리고 Consumer 측 `ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent>`가 **해당 타입**으로 생성되도록 설정합니다.
+
+***
+
+### 옵션 B. 공통 설정을 `shop-common`으로 끌어올리기 (재사용/표준화)
+
+*   `shop-common`을 **Auto-Configuration 모듈**(예: `@Configuration` + `spring.factories`/`META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`)로 만들어,
+    *   **Producer 표준 설정 빈** (KafkaTemplate, ProducerFactory)
+    *   **Consumer 표준 설정 빈** (JsonDeserializer, ListenerContainerFactory)
+        를 제공
+*   각 서비스(`shop-order`, `shop-product`, `shop-payment`)는 **shop-common 의존성만 추가**하고 **yml에는 최소한의 오버라이드만** 적는 방식
+
+> 장점: 표준화/일관성, 설정 중복 제거  
+> 단점: Auto-config 작성/유지보수 필요
+
+***
+
+## 자주 발생하는 실수와 빠른 점검 포인트
+
+*   [ ] `shop-order`에 **producer 설정이 없다** → 기본값은 `StringSerializer`; Consumer가 `JsonDeserializer`면 **타입 불일치**
+*   [ ] Producer `spring.json.add.type.headers: true`인데 Consumer `spring.json.use.type.headers: false` → 타입 매핑 실패
+*   [ ] Consumer에 `spring.json.trusted.packages` 누락 → 역직렬화 거부
+*   [ ] Listener 파라미터 타입이 `String`인데 ContainerFactory는 `<String, OrderCreatedEvent>` → **시그니처-팩토리 불일치**
+*   [ ] 하나의 토픽에 여러 이벤트 타입을 섞어 보낸다면 → **타입 헤더 필수** 혹은 **메시지 헤더 기반 라우팅/별도 default.type** 필요
+*   [ ] `KafkaTemplate<String, OrderCreatedEvent>` 제네릭과 ProducerFactory 제네릭/설정 불일치
+
+***
+
+## 최소 변경 패치 (당장 에러 해소용)
+
+1.  **`shop-order`에 Producer 설정 추가** (JSON 직렬화)
+
+```yaml
+# shop-order/application.yml
+spring:
+  kafka:
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: true
+```
+
+2.  **Consumer 쪽에서 타입 헤더 사용** (이미 있다면 확인만)
+
+```yaml
+# shop-product/application.yml, shop-payment/application.yml
+spring:
+  kafka:
+    consumer:
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.ecommerce.common.event
+        spring.json.use.type.headers: true
+```
+
+> 만약 Producer에서 타입 헤더를 붙이기 어렵다면:  
+> Consumer에 `spring.json.value.default.type: com.ecommerce.common.event.OrderCreatedEvent`를 지정해도 됩니다(단일 타입 토픽일 때 권장).
+
+***
+
+## 참고: Listener/ContainerFactory 예시 (Consumer 쪽)
+
+```java
+@Configuration
+@EnableKafka
+public class KafkaConsumerConfig {
+
+    @Bean
+    public ConsumerFactory<String, OrderCreatedEvent> orderEventConsumerFactory(
+            KafkaProperties kafkaProperties) {
+
+        Map<String, Object> props = new HashMap<>(kafkaProperties.buildConsumerProperties());
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "com.ecommerce.common.event");
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, true);
+        // props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.ecommerce.common.event.OrderCreatedEvent");
+
+        return new DefaultKafkaConsumerFactory<>(
+                props,
+                new StringDeserializer(),
+                new JsonDeserializer<>(OrderCreatedEvent.class, false)
+        );
+    }
+
+    @Bean(name = "orderEventContainerFactory")
+    public ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent> orderEventContainerFactory(
+            ConsumerFactory<String, OrderCreatedEvent> cf) {
+        var factory = new ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent>();
+        factory.setConsumerFactory(cf);
+        return factory;
+    }
+}
+```
+
+***
+
+## 요약
+
+*   **보내는 모듈(`shop-order`)에 Producer(JSON) 설정을 반드시 넣어주세요.**  
+    → `value-serializer: JsonSerializer`, `spring.json.add.type.headers: true`
+*   **받는 모듈(`shop-product`, `shop-payment`)은 Consumer(JSON) 설정을 맞추세요.**  
+    → `value-deserializer: JsonDeserializer`, `trusted.packages`, `use.type.headers: true`
+*   이 조합이면 `OrderEventProducer`의 `kafkaTemplate.send(TOPIC, event)`에서 보낸 이벤트가 **타입 안전하게 역직렬화**됩니다.
+
+***
+
+필요하시면 **현재 각 모듈의 `application.yml`과 `@KafkaListener`/`KafkaTemplate` 코드**를 주시면, 딱 거기에 맞춰 **diff 형태 패치**로 정리해 드리겠습니다.
+
