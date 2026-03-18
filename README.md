@@ -543,3 +543,161 @@ public class KafkaConsumerConfig {
 
 필요하시면 **현재 각 모듈의 `application.yml`과 `@KafkaListener`/`KafkaTemplate` 코드**를 주시면, 딱 거기에 맞춰 **diff 형태 패치**로 정리해 드리겠습니다.
 
+공유해주신 `docker-compose.yml` 구성이라면 **한 개 브로커 + Zookeeper** 환경이고, 내부 통신도 PLAINTEXT라 비교적 단순합니다.  
+지금 경고는 **컨트롤러 스레드가 브로커(`shop_kafka:9092`)로 인터브로커 연결을 시도했으나 실패**했다는 뜻이라서, 보통 아래 둘 중 하나가 원인입니다.
+
+1.  **advertised.listeners / listeners / inter.broker.listener.name 불완전 설정**
+2.  **DNS/네트워크에서 `shop_kafka` 해석 또는 포트 접근 문제**
+
+현재 compose에는 `KAFKA_ADVERTISED_LISTENERS`만 지정되어 있고, 나머지가 **암묵적 기본값**에 의존 중입니다. 컨테이너/호스트 상황에 따라 기본값이 예상과 다르면 지금 같은 연결 실패가 날 수 있습니다.  
+**명시적으로 리스너들을 고정**하는 것을 강력 추천드립니다.
+
+***
+
+## ✅ 권장 수정안 (내부용 9092 / 호스트용 29092 이중 리스너)
+
+> 내부 컨테이너들(예: `kafka-ui`, 애플리케이션)은 `shop_kafka:9092`로 붙고,  
+> 로컬 호스트(개발자 PC)에서 테스트할 땐 `localhost:29092`로 붙는 패턴입니다.  
+> 인터브로커는 내부 리스너(INTERNAL, 9092)를 사용하게 고정합니다.
+
+```yaml
+version: "3.9"
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: shop_zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: shop_kafka
+    ports:
+      - "9092:9092"   # 내부용(컨테이너 네트워크) 리스너도 노출 가능
+      - "29092:29092" # 호스트에서 접근할 외부용 리스너
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: shop_zookeeper:2181
+
+      # 1) 리스너 정의(바인딩)
+      #    - INTERNAL: 컨테이너 내부 네트워크용
+      #    - EXTERNAL: 호스트에서 접근용
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+
+      # 2) 광고 주소(클라이언트/브로커에게 알려줄 주소)
+      #    - INTERNAL은 컨테이너 간 DNS 이름 사용 (shop_kafka)
+      #    - EXTERNAL은 호스트에서 접속 가능한 주소/포트 사용
+      #      로컬 테스트면 localhost, 다른 PC에서 접속이면 해당 호스트 IP로 바꿔주세요.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://shop_kafka:9092,EXTERNAL://localhost:29092
+
+      # 3) 보안 프로토콜 매핑 (둘 다 PLAINTEXT)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+      # 4) 인터브로커 리스너는 INTERNAL로 고정
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # 옵션: 단일 브로커 환경에서 시스템 토픽 복제 팩터 경고 방지
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # 편의 옵션
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      ALLOW_PLAINTEXT_LISTENER: 'yes'
+    depends_on:
+      - zookeeper
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: shop_kafka_ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      # 내부 네트워크에서 브로커를 볼 수 있도록 INTERNAL 주소로
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: shop_kafka:9092
+    depends_on:
+      - kafka
+
+volumes:
+  kafka_data:
+```
+
+> **중요 포인트**
+>
+> *   `KAFKA_LISTENERS` / `KAFKA_ADVERTISED_LISTENERS` / `KAFKA_LISTENER_SECURITY_PROTOCOL_MAP` / `KAFKA_INTER_BROKER_LISTENER_NAME` 네 가지를 **명시적으로** 세팅.
+> *   인터브로커는 **INTERNAL(9092)** 를 사용 → 컨트롤러 스레드가 `shop_kafka:9092`로 정상 접속.
+> *   외부 접속이 필요하면 `EXTERNAL://localhost:29092` (또는 실제 호스트 IP/도메인)로 광고.
+> *   `kafka-ui` 같은 컨테이너는 INTERNAL 주소(`shop_kafka:9092`)로 붙이기.
+
+***
+
+## 🔍 즉시 점검 순서 (수정 후 재기동)
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
+1.  **브로커 포트 리스닝 확인**
+
+```bash
+docker exec -it shop_kafka bash -lc "lsof -i -P -n | grep -E '9092|29092'"
+```
+
+2.  **컨테이너 내부에서 DNS/포트 확인**
+
+```bash
+docker exec -it shop_kafka bash -lc "getent hosts shop_kafka && nc -vz shop_kafka 9092"
+```
+
+3.  **메타데이터 조회 (컨테이너 내부)**
+
+```bash
+# kcat이 없으면 kafka-console-producer/consumer로 메타데이터만 확인해도 됩니다.
+docker exec -it shop_kafka bash -lc "kafka-broker-api-versions --bootstrap-server shop_kafka:9092 || true"
+```
+
+4.  **호스트에서 외부 리스너 확인**
+
+```bash
+# 호스트 터미널
+nc -vz localhost 29092
+```
+
+5.  **로그 동시 확인 (타임스탬프 맞춰보기)**
+
+```bash
+docker logs -f shop_kafka | egrep -i "RequestSendThread|controller|connection|error|warn"
+```
+
+*   `UnknownHostException`, `Connection refused`, `Timed out`, `Handshake failed` 같은 키워드가 있으면 해당 방향으로 추가 진단.
+
+***
+
+## 자주 걸리는 함정 3가지
+
+1.  **EXTERNAL만 설정하고 INTERNAL을 생략**  
+    → 브로커가 **인터브로커 채널도 EXTERNAL**로 붙으려다, 호스트 경로를 통해 NAT/포트포워딩을 거치며 실패하는 경우가 있습니다. 반드시 `INTER_BROKER_LISTENER_NAME=INTERNAL`로 고정하세요.
+
+2.  **`KAFKA_ADVERTISED_LISTENERS`에 잘못된 호스트/포트**
+    *   INTERNAL에 `localhost`를 넣으면 **다른 컨테이너에서 접근 불가**합니다. INTERNAL은 **컨테이너 DNS 이름**(`shop_kafka`)을 쓰세요.
+    *   EXTERNAL은 **호스트에서 실제로 접근 가능한 주소**(localhost/호스트 IP/도메인)로 맞추세요.
+
+3.  **포트 충돌/방화벽**
+    *   호스트에서 이미 9092/29092를 쓰고 있으면 리스닝 실패 → 다른 포트를 쓰거나 충돌 프로세스를 종료하세요.
+
+***
+
+## 계속 실패한다면 알려주세요 (필요 정보)
+
+*   `docker exec -it shop_kafka bash -lc "cat /etc/hosts; env | egrep 'KAFKA_|ALLOW_|LISTENER'"`
+*   동일 시각대의 `docker logs shop_kafka` 워닝/에러 라인 몇 줄
+*   호스트 OS/방화벽 상태(회사 망/보안툴로 포트 차단 여부)
+
+부장님 환경상 지금 경고는 **인터브로커용 리스너/광고 주소 설정을 명시하지 않아 생긴 해석·경로 문제**일 가능성이 가장 높습니다. 위 설정으로 정리하면 컨트롤러의 `shop_kafka:9092` 연결 실패가 사라질 확률이 큽니다. 적용 후 결과 주시면, 필요 시 SSL/SASL 전환이나 멀티 브로커 확장 구성까지 이어서 잡아드리겠습니다.
