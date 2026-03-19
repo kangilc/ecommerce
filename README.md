@@ -700,4 +700,194 @@ docker logs -f shop_kafka | egrep -i "RequestSendThread|controller|connection|er
 *   동일 시각대의 `docker logs shop_kafka` 워닝/에러 라인 몇 줄
 *   호스트 OS/방화벽 상태(회사 망/보안툴로 포트 차단 여부)
 
-부장님 환경상 지금 경고는 **인터브로커용 리스너/광고 주소 설정을 명시하지 않아 생긴 해석·경로 문제**일 가능성이 가장 높습니다. 위 설정으로 정리하면 컨트롤러의 `shop_kafka:9092` 연결 실패가 사라질 확률이 큽니다. 적용 후 결과 주시면, 필요 시 SSL/SASL 전환이나 멀티 브로커 확장 구성까지 이어서 잡아드리겠습니다.
+공유해주신 Spring Boot **producer(yml)** 설정을 기준으로, 지금의 Kafka 브로커 구성(내부 `shop_kafka:9092` / 외부 `localhost:29092` 권장안)과 **정확히 맞물리게** 만드는 방법, 추가로 **안전한 프로듀서 튜닝/직렬화 설정/트러블슈팅 포인트**까지 한 번에 정리했습니다.
+
+***
+
+## 1) 먼저, 프로듀서가 어디에서 동작하나요?
+
+*   **컨테이너 내부(같은 docker-compose 네트워크)** 에서 동작 ⟶ `bootstrap-servers: shop_kafka:9092` 가 **정답**
+*   **호스트(로컬 PC)** 에서 동작 ⟶ `bootstrap-servers: localhost:29092` 로 바꿔야 **정상 접속**
+
+> 앞서 드린 compose 권장안(INTERNAL/EXTERNAL 이중 리스너)을 적용했다면,
+>
+> *   컨테이너는 **INTERNAL(shop\_kafka:9092)** 로,
+> *   호스트는 **EXTERNAL(localhost:29092)** 로 붙어야 합니다.
+
+***
+
+## 2) Spring Boot(Kafka) 프로듀서 권장 설정 예시
+
+> **컨테이너 내부에서 실행**한다는 가정(= `shop_kafka:9092` 유지).  
+> 안전성과 처리량을 균형 있게 맞춘 프로덕션 기본값을 제안합니다.
+
+```yaml
+server:
+  port: 8081
+
+spring:
+  application:
+    name: order-service
+
+  datasource:
+    url: jdbc:mysql://localhost:3306/shop_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: shop_user
+    password: shop_password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  kafka:
+    bootstrap-servers: shop_kafka:9092  # ← 컨테이너 내부에서 실행 시
+    # (호스트에서 실행 시) bootstrap-servers: localhost:29092
+
+    producer:
+      # --- 직렬화 ---
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+      # --- 내구성/정확성 ---
+      # 정확히 한 번 전송(멱등) + 최소 중복 방지
+      properties:
+        enable.idempotence: true           # 멱등성 활성화 (acks=all 자동 요구)
+        acks: all                          # 모든 ISR에 기록될 때 성공 처리
+        retries: 2147483647                # 무한대 수준 재시도
+        max.in.flight.requests.per.connection: 5  # 멱등성과 함께 안전한 최대 동시 요청
+
+        # --- 지연·배치·압축: 처리량 최적화 ---
+        linger.ms: 5                       # 약간 지연 후 배치
+        batch.size: 65536                  # 64KB 배치
+        compression.type: lz4              # (선호: lz4 or zstd) 브로커/컨슈머와 호환
+
+        # --- 타임아웃 ---
+        delivery.timeout.ms: 120000        # 전체 전송 타임아웃(ack 포함)
+        request.timeout.ms: 30000
+
+        # --- JSON Serializer 관련 ---
+        # Consumer가 타입 매핑을 자동으로 하려면 true(기본), 서로 다른 서비스 간엔 false 권장
+        spring.json.add.type.headers: false
+        # (false일 경우) Consumer 쪽에서 default.value.type 또는 trusted.packages/TypeMapper 설정 필요
+
+      # 레코드 전송 실패 시 콜백/리트라이용
+      properties.spring.kafka.producer.transaction-id-prefix: order-tx-  # 트랜잭션 쓸 때만
+      # (트랜잭션 미사용이면 위 라인 제거)
+
+    # (선택) KafkaTemplate의 sync send timeout
+    properties:
+      spring.kafka.template.observation-enabled: true
+```
+
+> **왜 `spring.json.add.type.headers: false`?**  
+> 팀 간(서로 다른 서비스) 이벤트 교환 시 클래스명이 헤더로 섞이면 **의존성 결합**이 생겨요.  
+> 컨슈머에서 `JsonDeserializer`에 **명시 타입 매핑(default.type / type.mapper / trusted.packages)** 을 두고,  
+> 이벤트 payload는 **스키마(필드) 기준 계약**으로 관리하는 게 안전합니다.  
+> (반대로, **동일 코드베이스 내부**에서만 쓰면 `true` 도 편리합니다.)
+
+***
+
+## 3) (중요) 컨슈머/프로듀서 타입 불일치 이슈 방지
+
+부장님이 어제 공유하신 예외:
+
+    ClassCastException: com.ecommerce.common.event.OrderCreatedEvent cannot be cast to String
+
+*   **원인**: 컨슈머가 `StringDeserializer`를 쓰거나, 메시지를 String으로 가정했는데 **프로듀서는 JSON(Object)** 을 보낸 상황.
+*   **대응**:
+    *   프로듀서: `JsonSerializer` 유지
+    *   컨슈머: `JsonDeserializer` + 타입 지정
+        ```yaml
+        spring:
+          kafka:
+            consumer:
+              key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+              value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+              properties:
+                spring.json.trusted.packages: "com.ecommerce.common.event"  # 또는 "*"
+                spring.json.value.default.type: "com.ecommerce.common.event.OrderCreatedEvent"
+                # 만약 add.type.headers=true 라면 default.type 대신 헤더 기반 매핑 가능
+        ```
+    *   또는 **둘 다 String** 으로 맞춘 뒤, 애플리케이션에서 수동 JSON 파싱(Gson/Jackson)도 가능합니다.  
+        (이 경우 프로듀서 value-serializer를 `StringSerializer` 로 변경)
+
+***
+
+## 4) 토픽/파티션/복제 관련 체크
+
+*   `KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'` 이면 **첫 전송 시 토픽 자동 생성**됩니다.  
+    다만 **파티션 수/복제 팩터**가 기본값으로 생성되기 때문에, 운영에서는 **명시 생성** 권장:
+    ```bash
+    kafka-topics --bootstrap-server shop_kafka:9092 \
+      --create --topic order.created --partitions 6 --replication-factor 1
+    ```
+*   단일 브로커라면 `replication-factor=1` 고정. 복제를 늘리려면 브로커를 추가해야 합니다.
+
+***
+
+## 5) 운영/테스트 점검 루틴
+
+### A) 연결/메타데이터 확인
+
+```bash
+# 컨테이너 내부
+docker exec -it shop_kafka bash -lc "kafka-broker-api-versions --bootstrap-server shop_kafka:9092"
+# 호스트에서 EXTERNAL 확인
+nc -vz localhost 29092
+```
+
+### B) 간단 발행/구독 테스트
+
+```bash
+# 컨테이너 내부에서 콘솔 프로듀서
+docker exec -it shop_kafka bash -lc "kafka-console-producer --bootstrap-server shop_kafka:9092 --topic quick-test"
+> hello
+> ^C
+
+# 컨테이너 내부에서 콘솔 컨슈머
+docker exec -it shop_kafka bash -lc "kafka-console-consumer --bootstrap-server shop_kafka:9092 --topic quick-test --from-beginning --timeout-ms 5000"
+```
+
+### C) 애플리케이션 측 로그/지표
+
+*   `TimeoutException: Expiring 1 record(s) due to ...` → 브로커 접근/네트워크/acks 지연
+*   `UnknownHostException: shop_kafka` → DNS(컨테이너 네트워크 밖에서 접근)
+*   `NotEnoughReplicas` → 단일 브로커인데 acks=all + replication-factor>1 요구 시
+*   `RecordTooLargeException` → `max.request.size`, 브로커 `message.max.bytes` 상향 필요
+
+***
+
+## 6) docker-compose와의 정합성(요약)
+
+*   브로커:
+    *   `LISTENERS`: `INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092`
+    *   `ADVERTISED_LISTENERS`: `INTERNAL://shop_kafka:9092,EXTERNAL://localhost:29092`
+    *   `INTER_BROKER_LISTENER_NAME`: `INTERNAL`
+*   프로듀서(Spring Boot):
+    *   **컨테이너 내부 실행**: `bootstrap-servers: shop_kafka:9092`
+    *   **호스트에서 실행**: `bootstrap-servers: localhost:29092`
+
+> ※ `kafka-ui` 같은 도구는 **INTERNAL 주소(shop\_kafka:9092)** 로 설정해야 컨테이너 간 네트워크에서 바로 접근 가능합니다.
+
+***
+
+## 7) (옵션) 운영 안정성 보강 팁
+
+*   **헤더/타입 계약**: `add.type.headers=false`로 느슨 결합 + 이벤트 스키마 문서화
+*   **Key 전략**: 파티셔닝을 위해 `orderId` 등 비즈니스 키를 **message key** 로 사용
+*   **관찰성**: `client.id`, `metrics.recording.level=INFO`, **Datadog/Prometheus**로 `record-error-rate`, `request-latency-avg` 모니터링
+*   **에러 핸들링**: `KafkaTemplate` send 콜백에서 실패 로깅 + 재시도/보상 트랜잭션 설계
+
+***
+
+## 다음 확인 요청 (두 가지만 알려주시면 설정을 더 정밀 튜닝해드릴게요)
+
+1.  **order-service가 컨테이너 내부에서 돌고 있는지**, 아니면 **호스트(로컬)에서 직접 실행하는지**
+2.  사용 중인 **토픽 이름/메시지 키 전략**(예: `order.created`, key=`orderId`)
+
+이 두 가지에 맞춰 `bootstrap-servers` 최종값과 프로듀서 옵션(배치/압축/타임아웃)을 딱 맞춰 드리겠습니다.
+
