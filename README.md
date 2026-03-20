@@ -891,3 +891,141 @@ docker exec -it shop_kafka bash -lc "kafka-console-consumer --bootstrap-server s
 
 이 두 가지에 맞춰 `bootstrap-servers` 최종값과 프로듀서 옵션(배치/압축/타임아웃)을 딱 맞춰 드리겠습니다.
 
+다음 중 하나 때문에 나타나는 현상입니다:
+
+1.  **이미 Git에 추적(Tracked)되었기 때문**  
+    `.gitignore`는 *새로 생성되는 “미추적(untracked)” 파일*에만 적용됩니다. 예전에 한 번이라도 `shop-payment/build/tmp/compileJava/previous-compilation-data.bin`이 커밋/스테이징 되었다면, `.gitignore`를 추가해도 계속 커밋 후보에 뜹니다.
+
+2.  **패턴/위치가 맞지 않음**
+
+*   `.gitignore`가 **루트**에 있는데 패턴이 `shop-payment/build`로 정확히 안 맞거나, 앞에 `/` 여부로 의도와 다르게 동작할 수 있습니다.
+*   **서브모듈(모듈별)** 디렉터리 `shop-payment/` 안에 별도의 `.gitignore`가 없어서, 루트 규칙이 제대로 적용되지 않을 수도 있습니다(대부분은 적용되지만, 상대 경로 실수로 누락되는 경우가 잦습니다).
+*   상위 `.gitignore`나 다른 규칙에서 `!`(negation)으로 **예외**가 걸렸을 가능성도 있습니다.
+
+***
+
+## 빠른 해결책
+
+### A. 이미 추적 중이라면: 인덱스에서 제거
+
+```bash
+# 특정 파일만 인덱스에서 제거
+git rm --cached shop-payment/build/tmp/compileJava/previous-compilation-data.bin
+
+# 전체 build 디렉터리를 인덱스에서 제거(이미 추적 중인 파일만)
+git rm -r --cached shop-payment/build
+
+git commit -m "Stop tracking shop-payment/build artifacts"
+```
+
+> 이후부터는 `.gitignore` 규칙이 제대로 되어 있으면 다시 등장하지 않습니다.
+
+### B. .gitignore 패턴 확실히 하기
+
+\*\*루트 `.gitignore`\*\*에서 프로젝트 전반에 적용하려면:
+
+```gitignore
+# 모든 모듈의 build 디렉터리 무시
+**/build/
+```
+
+특정 모듈만(= shop-payment만) 무시하려면:
+
+```gitignore
+/shop-payment/build/
+```
+
+\*\*모듈 폴더 `shop-payment/` 내부의 `.gitignore`\*\*에 넣을 수도 있습니다(모듈 단위로 깔끔):
+
+```gitignore
+# shop-payment/.gitignore
+/build/
+```
+
+> 팁: Gradle 프로젝트는 보통 `**/build/` 무시가 가장 편합니다. `tmp`, `generated`, `reports` 등도 모두 `build` 아래에 생기므로 한 번에 처리됩니다.
+
+***
+
+## 진단 체크리스트
+
+1.  **이 파일이 추적 중인지 확인**
+    ```bash
+    git ls-files -- shop-payment/build/tmp/compileJava/previous-compilation-data.bin
+    ```
+    출력되면 이미 추적 중 → A 단계(인덱스 제거) 수행.
+
+2.  **어떤 ignore 규칙이 적용되는지 확인**
+    ```bash
+    git check-ignore -v shop-payment/build/tmp/compileJava/previous-compilation-data.bin
+    ```
+    *   출력이 없으면 해당 파일은 ignore 규칙에 **걸리지 않음** → B 단계(패턴 수정).
+    *   출력되면 어느 파일의 어떤 라인 규칙이 적용되는지 확인 가능.
+    *   만약 `!something` 같은 **예외 규칙**이 보이면 그 라인이 원인.
+
+3.  **로컬 전용 exclude도 확인(가끔 숨은 원인)**
+    *   `.git/info/exclude` (로컬 전용)
+    *   **글로벌 gitignore** (`git config --get core.excludesfile` 로 경로 확인)
+
+4.  **IDE 캐시/표시 이슈 확인**
+    *   IntelliJ 등에서 VCS 보기와 실제 Git 상태가 어긋나는 경우가 있습니다. `git status` 로 실제 상태를 확인하세요.
+
+***
+
+## 권장 `.gitignore` (Gradle/Java 공통)
+
+루트 `.gitignore`에 아래를 포함하면 대부분의 바이너리를 방지할 수 있습니다:
+
+```gitignore
+# Gradle
+**/build/
+.gradle/
+.gradle-cache/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ / Eclipse
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Java
+*.class
+```
+
+> `!gradle/wrapper/gradle-wrapper.jar`는 래퍼 JAR을 **커밋에 포함**하려면 제외 해제(negation) 규칙을 둡니다. 조직 정책에 맞게 조정하세요.
+
+***
+
+## 최종 권장 절차 (한 번에 끝내기)
+
+1.  루트 `.gitignore`에 `**/build/` 추가
+2.  인덱스에서 기존 추적 제거:
+
+```bash
+git rm -r --cached shop-payment/build
+```
+
+3.  커밋:
+
+```bash
+git commit -m "Ignore Gradle build outputs"
+```
+
+4.  확인:
+
+```bash
+git status
+git check-ignore -v shop-payment/build/tmp/compileJava/previous-compilation-data.bin
+```
+
+원하시면 현재 `.gitignore` 내용을 붙여주시면, **정확한 라인 레벨로** 무엇 때문에 예외 발생했는지 바로 짚어서 수정해 드릴게요.
