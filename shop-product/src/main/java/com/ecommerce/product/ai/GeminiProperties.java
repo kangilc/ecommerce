@@ -13,7 +13,7 @@ public class GeminiProperties {
 
     public GeminiProperties(
             @Value("${gemini.api-key:}") String apiKey,
-            @Value("${gemini.model:gemini-4-hydrogen}") String model) {
+            @Value("${gemini.model:gemini-3.5-flash-lite}") String model) {
         this.apiKey = apiKey;
         this.model = model;
     }

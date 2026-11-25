@@ -3,6 +3,8 @@ package com.ecommerce.product.ai;
 import com.ecommerce.common.exception.CustomException;
 import com.ecommerce.common.exception.ErrorCode;
 import com.google.genai.Client;
+import com.google.genai.gaos.models.errors.CreateInteractionClientError;
+import com.google.genai.gaos.models.errors.CreateInteractionServerError;
 import com.google.genai.gaos.models.interactions.Content;
 import com.google.genai.gaos.models.interactions.CreateModelInteraction;
 import com.google.genai.gaos.models.interactions.CreateModelInteractionResponseFormat;
@@ -18,6 +20,7 @@ import com.google.genai.gaos.models.interactions.TextResponseFormatMimeType;
 import com.google.genai.gaos.models.operations.CreateInteractionRequestBody;
 import com.google.genai.gaos.models.operations.CreateInteractionResponse;
 import java.util.Map;
+import java.util.function.Function;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -30,6 +33,8 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class GoogleGenAiGateway implements GeminiInteractionGateway {
 
+    private static final String FALLBACK_MODEL = "gemini-3.1-flash-lite";
+
     private final GeminiProperties properties;
     private volatile Client cachedClient;
 
@@ -39,18 +44,19 @@ public class GoogleGenAiGateway implements GeminiInteractionGateway {
             String systemInstruction,
             String prompt,
             String previousInteractionId) {
-        CreateModelInteraction.Builder builder = CreateModelInteraction.builder()
-                .model(Model.of(model))
-                .input(InteractionsInput.of(prompt));
+        return executeWithFallback(model, targetModel -> {
+            CreateModelInteraction.Builder builder = CreateModelInteraction.builder()
+                    .model(Model.of(targetModel))
+                    .input(InteractionsInput.of(prompt));
 
-        if (systemInstruction != null && !systemInstruction.isBlank()) {
-            builder.systemInstruction(systemInstruction);
-        }
-        if (previousInteractionId != null && !previousInteractionId.isBlank()) {
-            builder.previousInteractionId(previousInteractionId);
-        }
-
-        return executeInteraction(builder.build());
+            if (systemInstruction != null && !systemInstruction.isBlank()) {
+                builder.systemInstruction(systemInstruction);
+            }
+            if (previousInteractionId != null && !previousInteractionId.isBlank()) {
+                builder.previousInteractionId(previousInteractionId);
+            }
+            return builder.build();
+        });
     }
 
     @Override
@@ -59,25 +65,49 @@ public class GoogleGenAiGateway implements GeminiInteractionGateway {
             String systemInstruction,
             String prompt,
             Map<String, Object> jsonSchema) {
-        CreateModelInteraction.Builder builder = CreateModelInteraction.builder()
-                .model(Model.of(model))
-                .input(InteractionsInput.of(prompt))
-                .responseFormat(
-                        CreateModelInteractionResponseFormat.of(
-                                ResponseFormat.of(
-                                        TextResponseFormat.builder()
-                                                .mimeType(TextResponseFormatMimeType.APPLICATION_JSON)
-                                                .schema(jsonSchema)
-                                                .build())));
+        return executeWithFallback(model, targetModel -> {
+            CreateModelInteraction.Builder builder = CreateModelInteraction.builder()
+                    .model(Model.of(targetModel))
+                    .input(InteractionsInput.of(prompt))
+                    .responseFormat(
+                            CreateModelInteractionResponseFormat.of(
+                                    ResponseFormat.of(
+                                            TextResponseFormat.builder()
+                                                    .mimeType(TextResponseFormatMimeType.APPLICATION_JSON)
+                                                    .schema(jsonSchema)
+                                                    .build())));
 
-        if (systemInstruction != null && !systemInstruction.isBlank()) {
-            builder.systemInstruction(systemInstruction);
-        }
-
-        return executeInteraction(builder.build()).text();
+            if (systemInstruction != null && !systemInstruction.isBlank()) {
+                builder.systemInstruction(systemInstruction);
+            }
+            return builder.build();
+        }).text();
     }
 
-    private GeminiTextResult executeInteraction(CreateModelInteraction params) {
+    private GeminiTextResult executeWithFallback(
+            String primaryModel,
+            Function<String, CreateModelInteraction> requestFactory) {
+        try {
+            return executeInteraction(requestFactory.apply(primaryModel));
+        } catch (TransientGeminiException e) {
+            if (!FALLBACK_MODEL.equals(primaryModel)) {
+                log.warn("Primary model {} unavailable ({}); retrying with {}",
+                        primaryModel, e.getMessage(), FALLBACK_MODEL);
+                try {
+                    return executeInteraction(requestFactory.apply(FALLBACK_MODEL));
+                } catch (TransientGeminiException retryEx) {
+                    throw new CustomException(
+                            ErrorCode.INTERNAL_SERVER_ERROR,
+                            "Gemini API request failed: " + retryEx.getMessage());
+                }
+            }
+            throw new CustomException(
+                    ErrorCode.INTERNAL_SERVER_ERROR,
+                    "Gemini API request failed: " + e.getMessage());
+        }
+    }
+
+    private GeminiTextResult executeInteraction(CreateModelInteraction params) throws TransientGeminiException {
         Client client = getOrCreateClient();
         try {
             CreateInteractionResponse response =
@@ -89,6 +119,17 @@ public class GoogleGenAiGateway implements GeminiInteractionGateway {
             String text = extractOutputText(interaction);
             String interactionId = interaction.id().orElse(null);
             return new GeminiTextResult(text, interactionId);
+        } catch (CreateInteractionServerError e) {
+            log.error("Gemini API server error: {}", e.getMessage(), e);
+            throw new TransientGeminiException(e.getMessage());
+        } catch (CreateInteractionClientError e) {
+            if (e.getMessage() != null && e.getMessage().contains("429")) {
+                log.error("Gemini API rate limit error: {}", e.getMessage(), e);
+                throw new TransientGeminiException(e.getMessage());
+            }
+            log.error("Gemini API client error: {}", e.getMessage(), e);
+            throw new CustomException(
+                    ErrorCode.INVALID_INPUT_VALUE, "Gemini API request rejected: " + e.getMessage());
         } catch (CustomException e) {
             throw e;
         } catch (RuntimeException e) {
@@ -146,5 +187,11 @@ public class GoogleGenAiGateway implements GeminiInteractionGateway {
             return legacyGeminiKey.trim();
         }
         return null;
+    }
+
+    private static final class TransientGeminiException extends Exception {
+        private TransientGeminiException(String message) {
+            super(message);
+        }
     }
 }
