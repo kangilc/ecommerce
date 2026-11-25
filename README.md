@@ -1,4 +1,8 @@
 # ecommerce
+
+> **✨ Gemini API 연동 추가 (`shop-product` AI 상품 카피 생성 & 멀티턴 Q&A)**  
+> 변경된 아키텍처, API 명세, 환경변수(`GOOGLE_API_KEY`) 및 실행 방법은 [docs/GEMINI_AI.md](docs/GEMINI_AI.md)에서 확인할 수 있습니다.
+
 Prompt
 쇼핑몰 backend를 spring boot로 구축하고자 한다.
 Kafka를 이용한 이벤트 기반 시스템으로 개발 진행 예정.

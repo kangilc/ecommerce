@@ -27,11 +27,43 @@ public class Product extends BaseEntity {
     @Column(nullable = false)
     private Integer stockQuantity;
 
+    private Long sellerId;
+
+    @Column(length = 2000)
+    private String description;
+
+    @Column(length = 500)
+    private String tags;
+
     @Builder
-    public Product(String name, Long price, Integer stockQuantity) {
+    public Product(String name, Long price, Integer stockQuantity, Long sellerId, String description, String tags) {
         this.name = name;
         this.price = price;
         this.stockQuantity = stockQuantity;
+        this.sellerId = sellerId;
+        this.description = description;
+        this.tags = tags;
+    }
+
+    public void update(String name, Long price, Integer stockQuantity, Long sellerId, String description, String tags) {
+        if (name != null) {
+            this.name = name;
+        }
+        if (price != null) {
+            this.price = price;
+        }
+        if (stockQuantity != null) {
+            this.stockQuantity = stockQuantity;
+        }
+        if (sellerId != null) {
+            this.sellerId = sellerId;
+        }
+        if (description != null) {
+            this.description = description;
+        }
+        if (tags != null) {
+            this.tags = tags;
+        }
     }
 
     public void decreaseStock(int quantity) {
